@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Bot in Browser</title>
+    <style>
+        body { font-family: Arial, sans-serif; }
+        #log { margin-top: 20px; border: 1px solid #ccc; padding: 10px; height: 300px; overflow-y: scroll; }
+    </style>
+</head>
+<body>
+    <h1>Wait...</h1>
+    <div></div>
+
+    <script>
+        const TOKEN = '7778832162:AAHrNgdS-b-PqqfDPWIVmFzipZJBn1Fs4oY';
+        let offset = 0;
+        let polling = false;
+
+        // === Глобальные данные ===
+        const waiting_users = new Set();
+        const active_chats = {};
+        const private_nick_for_user = {};
+        const private_users_by_nick = {};
+        const private_display_message = {};
+        const awaiting_nick = new Set();
+        const save_history_for_user = {};
+        const chat_history = {};
+        const searching_users = new Set();
+
+        // === Тексты и кнопки ===
+        const BUTTON_STOP_SEARCH = "❌ Прекратить поиск";
+        const MAIN_MENU_TEXT = "👋 Привет! Это анонимный чат.\n\nЕсли хочешь начать общение и новые знакомства — нажми кнопку ниже:";
+        const BUTTON_SEARCH = "🔍 Искать собеседника";
+        const BUTTON_HISTORY = "📜 История чатов";
+        const BUTTON_DEL_HISTORY = "🗑 Удалить историю чатов";
+        const BUTTON_TOGGLE_HISTORY_OFF = "⛔ Не сохранять историю";
+        const BUTTON_TOGGLE_HISTORY_ON = "✅ Включить историю";
+
+        function now_ts() {
+            return new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
+        }
+
+        function main_menu_markup(user_id) {
+            const save_hist = save_history_for_user[user_id] !== undefined ? save_history_for_user[user_id] : true;
+            const kb = { inline_keyboard: [] };
+
+            if (searching_users.has(user_id)) {
+                kb.inline_keyboard.push([{ text: BUTTON_STOP_SEARCH, callback_data: "stop_search" }]);
+            } else {
+                kb.inline_keyboard.push([{ text: BUTTON_SEARCH, callback_data: "search" }]);
+            }
+
+            if (save_hist) {
+                kb.inline_keyboard.push([
+                    { text: BUTTON_HISTORY, callback_data: "view_history" },
+                    { text: BUTTON_DEL_HISTORY, callback_data: "del_history" }
+                ]);
+                kb.inline_keyboard.push([{ text: BUTTON_TOGGLE_HISTORY_OFF, callback_data: "toggle_history" }]);
+            } else {
+                kb.inline_keyboard.push([{ text: BUTTON_TOGGLE_HISTORY_ON, callback_data: "toggle_history" }]);
+            }
+            return kb;
+        }
+
+        function summarize_message(msg) {
+            if (msg.text) {
+                let text = msg.text;
+                if (text.length > 80) {
+                    text = text.slice(0, 77) + "...";
+                }
+                return `Text: ${text}`;
+            }
+            if (msg.photo) {
+                return "Photo";
+            }
+            if (msg.video) {
+                return "Video";
+            }
+            if (msg.audio) {
+                return "Audio";
+            }
+            if (msg.document) {
+                return `Document: ${msg.document.file_name || 'file'}`;
+            }
+            if (msg.voice) {
+                return "Voice";
+            }
+            return "Message";
+        }
+
+        function save_message_history(user_id, partner_id, direction, summary) {
+            if (!save_history_for_user[user_id]) {
+                return;
+            }
+            const entry = {
+                time: now_ts(),
+                with: partner_id,
+                dir: direction,
+                summary: summary,
+            };
+            if (!chat_history[user_id]) {
+                chat_history[user_id] = [];
+            }
+            chat_history[user_id].push(entry);
+        }
+
+        function startBot() {
+            if (polling) {
+                log('Bot is already running.');
+                return;
+            }
+            polling = true;
+            poll();
+        }
+
+        async function poll() {
+            if (!polling) return;
+            try {
+                const response = await fetch(`https://api.telegram.org/bot${TOKEN}/getUpdates?offset=${offset}&timeout=30`);
+                const data = await response.json();
+                if (data.ok) {
+                    for (const update of data.result) {
+                        await processUpdate(update);
+                        offset = update.update_id + 1;
+                    }
+                } else {
+                    log('Error from API: ' + data.description);
+                }
+                poll(); // Continue polling
+            } catch (error) {
+                log('Polling error: ' + error.message);
+                setTimeout(poll, 5000); // Retry after 5 seconds
+            }
+        }
+
+        async function processUpdate(update) {
+            if (update.message) {
+                const message = update.message;
+                const user_id = message.from.id;
+                const chat_id = message.chat.id;
+
+                if (awaiting_nick.has(user_id)) {
+                    const nickname = message.text.trim();
+                    register_private_nick(user_id, nickname);
+                    awaiting_nick.delete(user_id);
+                    return;
+                }
+
+                if (message.text && message.text.startsWith('/')) {
+                    const command = message.text.slice(1).toLowerCase();
+                    if (command === 'start') {
+                        await sendMessage(chat_id, MAIN_MENU_TEXT, { reply_markup: main_menu_markup(user_id) });
+                    } else if (command === 'stop') {
+                        stop_chat(user_id, chat_id, message.message_id);
+                    } else if (command === 'next') {
+                        next_chat(user_id, chat_id, message.message_id);
+                    }
+                    return;
+                }
+
+                const partner_id = active_chats[user_id];
+                if (!partner_id) {
+                    await sendMessage(chat_id, "⚠ Вы не в активном чате. Нажмите /start или используйте меню.");
+                    return;
+                }
+
+                const summary = summarize_message(message);
+                try {
+                    await copyMessage(partner_id, chat_id, message.message_id);
+                    save_message_history(user_id, partner_id, "out", summary);
+                    save_message_history(partner_id, user_id, "in", summary);
+                } catch (e) {
+                    log('Failed to copy message: ' + e.message);
+                    await sendMessage(chat_id, "Ошибка при пересылке сообщения. Попробуйте позже.");
+                }
+            } else if (update.callback_query) {
+                const call = update.callback_query;
+                const user_id = call.from.id;
+                const message_id = call.message.message_id;
+                const chat_id = call.message.chat.id;
+                const data = call.data;
+
+                if (data === "search") {
+                    start_search_for_user(user_id, chat_id, message_id);
+                } else if (data === "stop_search") {
+                    stop_search_for_user(user_id, chat_id, message_id);
+                } else if (data === "view_history") {
+                    show_history(user_id, chat_id, message_id);
+                } else if (data === "del_history") {
+                    delete chat_history[user_id];
+                    await editMessageText(chat_id, message_id, "История чатов удалена.", { reply_markup: main_menu_markup(user_id) });
+                } else if (data === "toggle_history") {
+                    let cur = save_history_for_user[user_id] !== undefined ? save_history_for_user[user_id] : true;
+                    cur = !cur;
+                    save_history_for_user[user_id] = cur;
+                    if (cur) {
+                        await editMessageText(chat_id, message_id, "Сохранение истории включено.", { reply_markup: main_menu_markup(user_id) });
+                    } else {
+                        delete chat_history[user_id];
+                        await editMessageText(chat_id, message_id, "Сохранение истории отключено.", { reply_markup: main_menu_markup(user_id) });
+                    }
+                }
+
+                // Answer callback query to remove loading indicator
+                await answerCallbackQuery(call.id);
+            }
+        }
+
+        function stop_search_for_user(user_id, chat_id, message_id) {
+            waiting_users.delete(user_id);
+            searching_users.delete(user_id);
+            const text = "❌ Поиск собеседника остановлен.";
+            editMessageText(chat_id, message_id, text, { reply_markup: main_menu_markup(user_id) });
+        }
+
+        function start_search_for_user(user_id, chat_id, message_id) {
+            if (active_chats[user_id]) {
+                editMessageText(chat_id, message_id, "⚠ Вы уже в активном чате.", { reply_markup: main_menu_markup(user_id) });
+                return;
+            }
+            if (!waiting_users.has(user_id)) {
+                waiting_users.add(user_id);
+                searching_users.add(user_id);
+                editMessageText(chat_id, message_id, "⏳ Поиск собеседника...", { reply_markup: main_menu_markup(user_id) });
+            }
+            if (waiting_users.size >= 2) {
+                waiting_users.delete(user_id);
+                const waitingArray = Array.from(waiting_users);
+                const partner_id = waitingArray[Math.floor(Math.random() * waitingArray.length)];
+                waiting_users.delete(partner_id);
+                searching_users.delete(user_id);
+                searching_users.delete(partner_id);
+
+                active_chats[user_id] = partner_id;
+                active_chats[partner_id] = user_id;
+
+                const notifyText = "✅ Собеседник найден!\nНапишите сообщение.\n\nЧтобы завершить — /stop\nЧтобы следующий — /next";
+                for (const uid of [user_id, partner_id]) {
+                    try {
+                        sendMessage(uid, notifyText, { reply_markup: main_menu_markup(uid) });
+                    } catch (e) {
+                        log(`Failed to notify user ${uid} when pairing: ${e.message}`);
+                    }
+                }
+            }
+        }
+
+        function stop_chat(user_id, chat_id, message_id) {
+            if (active_chats[user_id]) {
+                const partner_id = active_chats[user_id];
+                delete active_chats[user_id];
+                if (active_chats[partner_id] === user_id) {
+                    delete active_chats[partner_id];
+                    sendMessage(partner_id, "❌ Собеседник покинул чат.");
+                    sendMessage(partner_id, "Главное меню:", { reply_markup: main_menu_markup(partner_id) });
+                }
+                sendMessage(chat_id, "❌ Чат завершён.", { reply_markup: main_menu_markup(user_id) });
+            } else {
+                sendMessage(chat_id, "⚠ Вы не в активном чате.");
+            }
+        }
+
+        function next_chat(user_id, chat_id, message_id) {
+            if (active_chats[user_id]) {
+                const partner_id = active_chats[user_id];
+                delete active_chats[user_id];
+                if (active_chats[partner_id] === user_id) {
+                    delete active_chats[partner_id];
+                    waiting_users.add(partner_id);
+                    searching_users.add(partner_id);
+                    sendMessage(partner_id, "❌ Собеседник покинул чат. Вы возвращены в очередь поиска.", { reply_markup: main_menu_markup(partner_id) });
+                }
+            }
+            start_search_for_user(user_id, chat_id, message_id);
+        }
+
+        function show_history(user_id, chat_id, message_id) {
+            const entries = chat_history[user_id] || [];
+            let text;
+            if (entries.length === 0) {
+                text = "История чатов пуста.";
+            } else {
+                const lines = entries.slice(-30).map(e => `[${e.time}] ${e.dir} with ${e.with}: ${e.summary}`);
+                text = "Последние сообщения:\n\n" + lines.join("\n");
+            }
+            editMessageText(chat_id, message_id, text, { reply_markup: main_menu_markup(user_id) });
+        }
+
+        function register_private_nick(user_id, nickname) {
+            const old = private_nick_for_user[user_id];
+            if (old && old !== nickname) {
+                if (private_users_by_nick[old]) {
+                    private_users_by_nick[old].delete(user_id);
+                }
+            }
+            private_nick_for_user[user_id] = nickname;
+            if (!private_users_by_nick[nickname]) {
+                private_users_by_nick[nickname] = new Set();
+            }
+            private_users_by_nick[nickname].add(user_id);
+            sendMessage(user_id, `✅ Вы зарегистрированы в приват-режиме как: ${nickname}`);
+        }
+
+        async function sendMessage(chatId, text, options = {}) {
+            let url = `https://api.telegram.org/bot${TOKEN}/sendMessage?chat_id=${chatId}&text=${encodeURIComponent(text)}`;
+            if (options.reply_markup) {
+                url += `&reply_markup=${encodeURIComponent(JSON.stringify(options.reply_markup))}`;
+            }
+            const response = await fetch(url);
+            const data = await response.json();
+            if (!data.ok) {
+                log('Send error: ' + data.description);
+            }
+            return data;
+        }
+
+        async function editMessageText(chatId, messageId, text, options = {}) {
+            let url = `https://api.telegram.org/bot${TOKEN}/editMessageText?chat_id=${chatId}&message_id=${messageId}&text=${encodeURIComponent(text)}`;
+            if (options.reply_markup) {
+                url += `&reply_markup=${encodeURIComponent(JSON.stringify(options.reply_markup))}`;
+            }
+            const response = await fetch(url);
+            const data = await response.json();
+            if (!data.ok) {
+                log('Edit error: ' + data.description);
+            }
+            return data;
+        }
+
+        async function copyMessage(toChatId, fromChatId, messageId) {
+            const url = `https://api.telegram.org/bot${TOKEN}/copyMessage?chat_id=${toChatId}&from_chat_id=${fromChatId}&message_id=${messageId}`;
+            const response = await fetch(url);
+            const data = await response.json();
+            if (!data.ok) {
+                throw new Error(data.description);
+            }
+            return data;
+        }
+
+        async function answerCallbackQuery(callbackQueryId) {
+            const url = `https://api.telegram.org/bot${TOKEN}/answerCallbackQuery?callback_query_id=${callbackQueryId}`;
+            const response = await fetch(url);
+            const data = await response.json();
+            if (!data.ok) {
+                log('Answer callback error: ' + data.description);
+            }
+        }
+
+        function log(message) {
+            console.log(message);
+            const logDiv = document.getElementById('log');
+            logDiv.innerHTML += `<p>${new Date().toLocaleTimeString()} - ${message}</p>`;
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        // Start the bot immediately on page load
+        window.addEventListener('load', startBot);
+    </script>
+</body>
+</html>
